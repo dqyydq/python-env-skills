@@ -1,118 +1,97 @@
 ---
 name: python-env-setup
-description: Sets up Python virtual environments with uv (never conda/miniconda/mamba) for two kinds of projects — (1) lightweight CPU-only environments with no torch/GPU dependencies, and (2) GPU-accelerated environments needing torch/torchvision/torchaudio matched to the machine's NVIDIA driver CUDA ceiling. Always use this skill when the user asks to set up a Python project or venv, initialize a uv project, install PyTorch/torch/CUDA, or mentions deep learning / GPU training setup. Also use it any time the user reports torch installing the CPU-only build despite having a GPU, `torch.cuda.is_available()` returning False, torch silently reverting to CPU after installing another package, or numpy/torch version conflicts (e.g. "A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x", "Numpy is not available"). Do not use conda, miniconda, or mamba for any part of this — uv only.
+description: Create, inspect, and repair Python environments with uv only, never conda/miniconda/mamba. Use when the user asks to initialize a Python project, create a venv, install dependencies, migrate dependency management to uv, install PyTorch/torchvision/torchaudio, choose a CUDA wheel for NVIDIA GPUs, fix CPU-only torch being installed on a GPU machine, repair `torch.cuda.is_available()` returning False, prevent later `uv add`/`uv sync` from replacing CUDA torch with CPU torch, or resolve NumPy/PyTorch ABI errors such as "Numpy is not available", "_ARRAY_API not found", or "A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x".
 ---
 
-# Python Environment Setup (uv-based)
+# Python Environment Setup (uv)
 
-## Overview
+## Core Rules
 
-This skill creates Python environments with `uv` and, for GPU projects, pins PyTorch
-to the correct CUDA build so it never silently falls back to a CPU-only wheel — the
-single most common failure mode in this workflow. It also resolves numpy/torch
-version conflicts.
+- Use `uv` for all environment and dependency work. Do not use conda, miniconda, mamba, micromamba, or system Python mutation.
+- Prefer a project-local `.venv`.
+- Before modifying an existing project, inspect `pyproject.toml`, `uv.lock`, `uv.toml`, `requirements*.txt`, `.python-version`, and `.venv/`; merge with existing configuration instead of overwriting it.
+- For GPU/PyTorch work, do not guess version triples or CUDA tags from memory. Verify the official PyTorch command from `https://pytorch.org/get-started/locally/` or `https://pytorch.org/get-started/previous-versions/`, then translate `pip install ...` to `uv pip install ...`.
+- For persistent projects, do not rely only on a one-off `--index-url`; pin torch-family packages to an explicit uv index in `pyproject.toml`.
+- After any dependency change, run verification. GPU environments must prove that `torch.version.cuda` is not `None` and, when an NVIDIA GPU is available, `torch.cuda.is_available()` is `True`.
 
-Two reference files back this skill:
-- `references/pytorch-cuda-compatibility.md` — torch ⇄ CUDA wheel-tag matrix, driver/CUDA
-  compatibility, and how to look up the *current* matrix live (versions ship every few months,
-  so don't rely purely on memorized numbers).
-- `references/numpy-torch-compatibility.md` — which numpy major version each torch
-  release requires.
+## First Decision
 
-Read the relevant reference file before writing any install command — do not guess
-CUDA tags or numpy pins from memory.
+If the environment type is not obvious, ask one concise question:
 
-## Step 1 — Ask which environment type is needed
-
-If it isn't already obvious from context, ask the user directly (one short question):
-
-> "Does this project need PyTorch / GPU support, or is it a plain CPU-only environment
-> (no torch, no CUDA)?"
-
-If a tappable-choice tool is available in this client, offer exactly two options:
-**"CPU-only (no torch)"** and **"GPU / PyTorch (CUDA)"**. Otherwise just ask in plain text.
-Don't ask anything else up front — everything else (CUDA version, torch version) is
-detected or looked up, not asked.
-
-## Step 2 — Confirm uv is installed, never conda
-
-```bash
-uv --version || curl -LsSf https://astral.sh/uv/install.sh | sh
+```text
+Should this be a CPU-only Python environment, or an NVIDIA GPU / PyTorch CUDA environment?
 ```
 
-If you find an existing `environment.yml`, `conda`/`miniconda` references, or an active
-conda env in the project, tell the user you're migrating dependency management to uv and
-proceed — do not create or extend a conda environment, even if one already exists.
+If the project directory, Python version, dependency source, target PyTorch version, or CUDA backend is already clear from context or local files, do not ask again. Otherwise gather only the missing values.
 
-Initialize the project (skip if a `pyproject.toml` already exists):
+## Inspection
 
-```bash
-uv init --python 3.11   # pick the Python version the user needs; ask only if truly ambiguous
-```
-
-This gives you a `pyproject.toml` and a `.venv` managed entirely by uv.
-
-## Step 3a — CPU-only path
-
-Nothing special is needed. Just add packages normally:
+Run read-only checks before changing anything:
 
 ```bash
-uv add numpy pandas scikit-learn ...   # whatever the user needs
+uv --version
+uv python list
+python --version
 ```
 
-Skip everything below about CUDA indexes — a CPU-only project should never reference
-`download.pytorch.org` at all.
+For a richer report, use:
 
-## Step 3b — GPU / PyTorch path
+```bash
+python scripts/inspect_env.py --project .
+```
 
-### Detect the GPU and driver's max supported CUDA version
+For GPU work also run:
 
 ```bash
 nvidia-smi
+nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 ```
 
-The top-right of the output header shows `CUDA Version: XX.Y` — this is the **maximum**
-CUDA version the installed driver supports, not necessarily the CUDA version to install.
-If `nvidia-smi` isn't found, there is no usable NVIDIA GPU/driver on this machine; tell the
-user and fall back to the CPU-only path (or stop and ask how they want to proceed).
+`nvidia-smi` reports the maximum CUDA version supported by the driver. It is a ceiling, not the CUDA toolkit version to install.
 
-(`scripts/detect_gpu.sh` wraps this check and prints `CUDA_CEILING=XX.Y` or `NO_GPU` if you
-want a quick script instead of parsing `nvidia-smi` output by hand.)
+## CPU-Only Workflow
 
-### Pick the torch version and matching CUDA wheel tag
+Create or reuse the uv environment:
 
-1. Open `references/pytorch-cuda-compatibility.md` for the known-good matrix and the
-   general rule for picking a CUDA tag ≤ the driver's reported CUDA version.
-2. Because PyTorch ships new versions every few months, **verify against the live page**
-   before finalizing: web-search or fetch `https://pytorch.org/get-started/previous-versions/`
-   (or `https://pytorch.org/get-started/locally/` for the newest release) to confirm the
-   exact current `torch==X torchvision==Y torchaudio==Z` triple and index URL for the
-   chosen CUDA tag — do not hand-assemble version numbers from memory.
-3. Translate the official command into a uv command by adding `uv` in front and replacing
-   `pip install` with `uv pip install` (or use the `pyproject.toml` method below for a
-   persistent fix):
+```bash
+uv venv --python 3.11
+```
 
-   ```bash
-   # official site says:
-   #   pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-   # translate to:
-   uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu126
-   ```
+For project mode:
 
-### Make the CUDA index permanent (prevents silent CPU fallback)
+```bash
+uv init --python 3.11
+uv add <packages>
+uv lock
+uv sync
+```
 
-`uv pip install --index-url ...` only fixes the *current* install. The very common failure —
-installing another package later, or running `uv sync`/`uv add`, silently re-resolves torch
-from PyPI (which only has CPU wheels for Linux/Windows) and **replaces your GPU build with a
-CPU-only build** — happens because the CUDA index was never recorded in the project. Fix this
-by pinning torch (and torchvision/torchaudio) to the CUDA index inside `pyproject.toml`, not
-just on the command line:
+Do not add PyTorch or a PyTorch index unless the user explicitly asks for CPU PyTorch. If they do, use the official CPU index and exact official package versions.
+
+## NVIDIA GPU / PyTorch Workflow
+
+Read `references/pytorch-cuda-compatibility.md` before selecting a backend. If NumPy or binary-extension errors are relevant, also read `references/numpy-torch-compatibility.md`. For repair cases, read `references/troubleshooting.md`.
+
+1. Detect the NVIDIA driver ceiling with `nvidia-smi`.
+2. Choose a PyTorch version and only one of the CUDA wheel tags officially published for that exact version.
+3. Prefer the newest official CUDA wheel tag that is not newer than the driver ceiling.
+4. Translate the official PyTorch command mechanically:
+
+```bash
+uv pip install torch==<T> torchvision==<V> torchaudio==<A> --index-url https://download.pytorch.org/whl/<backend>
+```
+
+Do not run bare `uv add torch`, bare `uv pip install torch`, or `pip install torch` in GPU mode.
+
+## Persistent CUDA Index Pin
+
+For any project that will later use `uv add`, `uv lock`, `uv sync`, or repeated dependency changes, write the CUDA index into `pyproject.toml`:
 
 ```toml
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
-explicit = true          # only torch-family packages use this index; everything else stays on PyPI
+explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu126" }]
@@ -120,50 +99,94 @@ torchvision = [{ index = "pytorch-cu126" }]
 torchaudio = [{ index = "pytorch-cu126" }]
 ```
 
-Then run `uv add torch torchvision torchaudio` (or `uv sync`) — uv will now always resolve
-these three from the pinned CUDA index, on this project, permanently. See
-`references/pytorch-cuda-compatibility.md` for the macOS/CPU-fallback marker pattern if the
-project must also run on machines without a GPU.
+Then pin the exact torch, torchvision, and torchaudio versions in `[project].dependencies`, run `uv lock --dry-run`, then `uv lock` and `uv sync`.
 
-If the user only needs a one-off `uv pip install` (no `pyproject.toml`/project workflow), the
-`--index-url` command above is sufficient — the persistence step is specifically for
-`uv add` / `uv sync` / `uv lock` workflows.
+If the project already has `[tool.uv.sources]` or `[[tool.uv.index]]`, merge entries carefully. Do not create duplicate tables or remove private indexes.
 
-### Resolve numpy/torch conflicts
+## Simple venv / requirements Protection
 
-Check `references/numpy-torch-compatibility.md` and pin numpy accordingly, e.g.:
+When the project is intentionally not using `pyproject.toml`, create a constraint file such as `constraints-accelerator.txt`:
 
-```bash
-uv add "numpy<2" torch...   # for older torch builds that require numpy 1.x
+```text
+torch==<T>
+torchvision==<V>
+torchaudio==<A>
+numpy<2
 ```
 
-or leave numpy unconstrained for torch ≥2.3.1, which supports numpy 2.x.
-
-### Verify the install actually has CUDA
-
-Always verify after install — a "successful" `uv add`/`uv pip install` can still hand you
-a CPU-only wheel if the index wasn't pinned correctly:
+Install later dependencies with:
 
 ```bash
-uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+uv pip install --dry-run -c constraints-accelerator.txt <package>
+uv pip install -c constraints-accelerator.txt <package>
 ```
 
-`torch.cuda.is_available()` must be `True` and `torch.version.cuda` must be non-`None` on a
-GPU box. If it's `False`/`None`, torch resolved from PyPI instead of the CUDA index — re-check
-the `[tool.uv.sources]`/`explicit = true` config above, and re-run `uv sync --reinstall-package torch`.
+Avoid broad `--upgrade`. Do not uninstall or replace PyTorch just to install a model package.
 
-## Common pitfalls (checklist)
+## NumPy Strategy
 
-- **CPU wheel silently installed**: almost always means torch wasn't pinned to an
-  `explicit = true` CUDA index in `pyproject.toml`, so a later `uv add`/`uv sync` re-resolved
-  it from PyPI. Fix with the `[tool.uv.sources]` block above.
-- **`nvidia-smi`'s CUDA version ≠ install command's CUDA tag**: that's expected — the
-  driver-reported CUDA version is a ceiling, not a target. Pick the newest CUDA tag PyTorch
-  currently ships that is ≤ that ceiling (see reference file).
-- **numpy import errors after installing torch**: check
-  `references/numpy-torch-compatibility.md` — older torch builds (<2.3.1) require `numpy<2`.
-- **`uv add torch` with no index config picks CPU wheels on Linux/Windows**: PyPI's own
-  `torch` package is CPU-only for those platforms; GPU builds only exist on
-  `download.pytorch.org`, which is why the index must be configured explicitly.
-- **Never use conda/miniconda/mamba** for any part of this, even if the user's machine
-  already has it installed or an `environment.yml` exists — migrate to uv instead.
+Use `references/numpy-torch-compatibility.md` for the exact reasoning. Conservative defaults:
+
+- `torch <= 2.1`: use `numpy<2`.
+- `torch 2.2.x` to `2.4.x`: prefer `numpy<2` unless the project explicitly needs NumPy 2 and passes tests.
+- Newer torch versions can usually use `numpy>=1.26,<3`, but old OpenCV, SciPy, audio/video libraries, or custom C/C++ extensions may still require `numpy<2`.
+- Common fallback: `numpy==1.26.4`, but it supports Python 3.9 through 3.12. If Python 3.13 needs NumPy 1.x, use Python 3.12 or 3.11.
+
+## Guard and Verify
+
+Before installing a risky new package in a GPU environment:
+
+```bash
+uv run python scripts/torch_guard.py snapshot --backend cu126
+```
+
+After the change:
+
+```bash
+uv run python scripts/torch_guard.py check
+```
+
+Always run:
+
+```bash
+uv pip check
+uv pip tree
+```
+
+GPU verification:
+
+```bash
+uv run python - <<'PY'
+import numpy as np
+import torch
+
+print("torch", torch.__version__)
+print("torch CUDA build", torch.version.cuda)
+print("CUDA available", torch.cuda.is_available())
+print("NumPy", np.__version__)
+
+x = np.arange(6, dtype=np.float32).reshape(2, 3)
+t = torch.from_numpy(x)
+assert np.array_equal(x, t.cpu().numpy())
+
+if torch.version.cuda is None:
+    raise SystemExit("CPU wheel detected; expected CUDA wheel")
+if not torch.cuda.is_available():
+    raise SystemExit("CUDA wheel is installed, but no CUDA device is currently available")
+print("GPU", torch.cuda.get_device_name(0))
+PY
+```
+
+## Optional Helper
+
+For a guided local setup, use:
+
+```bash
+python scripts/create_uv_env.py
+```
+
+This helper is intentionally conservative and uses an offline compatibility snapshot. When internet access is available, refresh the PyTorch command from the official PyTorch pages before running GPU installs.
+
+## Completion Report
+
+Report the environment type, project directory, Python version, uv commands run, package versions, CUDA backend, `torch.version.cuda`, GPU name when available, `uv pip check` result, and the exact command the user should use for future dependency additions.

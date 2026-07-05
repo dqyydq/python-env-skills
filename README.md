@@ -1,57 +1,50 @@
 # python-env-setup
 
-一个用于 Codex / OpenAI Agents 的 Python 环境配置 skill，专注于使用 `uv` 创建和维护 Python 虚拟环境，并正确处理 PyTorch、CUDA 与 NumPy 之间最容易出错的依赖关系。
+Codex / OpenAI Agents skill for creating, inspecting, and repairing Python environments with `uv`.
 
-该 skill 的核心目标是：避免在有 NVIDIA GPU 的机器上误装 PyTorch CPU-only wheel，避免后续 `uv add` / `uv sync` 把 GPU 版 torch 静默替换回 CPU 版，并在旧版 PyTorch 与 NumPy 2.x 冲突时给出正确的约束。
+It focuses on the failure modes that usually cost the most time:
 
-## 适用场景
+- accidentally installing CPU-only PyTorch on a machine with an NVIDIA GPU
+- later `uv add` / `uv sync` replacing CUDA torch with CPU torch
+- choosing a CUDA wheel tag that the installed driver cannot support
+- mixing older PyTorch or binary extensions with NumPy 2.x
+- modifying an existing project without preserving its `pyproject.toml`, `uv.lock`, indexes, and constraints
 
-- 初始化 Python 项目或虚拟环境
-- 使用 `uv` 管理依赖，而不是 conda / miniconda / mamba
-- 安装 PyTorch、torchvision、torchaudio
-- 根据本机 NVIDIA 驱动支持的 CUDA 上限选择合适的 PyTorch CUDA wheel
-- 修复 `torch.cuda.is_available()` 返回 `False`
-- 修复 torch 被重新解析成 CPU-only build 的问题
-- 处理 NumPy 2.x 与旧版 PyTorch 的 ABI 兼容问题
+Only `uv` is used. Conda, miniconda, mamba, and micromamba are intentionally out of scope.
 
-## 目录结构
+## Contents
 
 ```text
 python-env-setup/
 ├── SKILL.md
+├── agents/
+│   └── openai.yaml
 ├── references/
 │   ├── numpy-torch-compatibility.md
-│   └── pytorch-cuda-compatibility.md
+│   ├── pytorch-cuda-compatibility.md
+│   └── troubleshooting.md
 └── scripts/
-    └── detect_gpu.sh
+    ├── create_uv_env.py
+    ├── detect_gpu.sh
+    ├── inspect_env.py
+    └── torch_guard.py
 ```
 
-文件说明：
+## Install
 
-- `SKILL.md`：skill 主说明文件，定义触发条件和完整工作流。
-- `references/pytorch-cuda-compatibility.md`：PyTorch、CUDA wheel tag、驱动 CUDA 上限和 uv 持久化配置参考。
-- `references/numpy-torch-compatibility.md`：NumPy 1.x / 2.x 与不同 PyTorch 版本的兼容关系。
-- `scripts/detect_gpu.sh`：辅助检测 NVIDIA GPU 和驱动支持的 CUDA 上限。
-
-## 安装到 Codex
-
-将整个目录复制或克隆到 Codex skills 目录中：
+Clone the repository into your Codex skills directory:
 
 ```powershell
 git clone https://github.com/dqyydq/python-env-skills.git $env:USERPROFILE\.codex\skills\python-env-setup
 ```
 
-如果你使用的是其他 `CODEX_HOME`，请放到对应的 skills 目录下：
+If `CODEX_HOME` is set, use that skills directory instead:
 
 ```powershell
 git clone https://github.com/dqyydq/python-env-skills.git $env:CODEX_HOME\skills\python-env-setup
 ```
 
-安装后，Codex 会通过 `SKILL.md` 的 frontmatter 自动识别该 skill。
-
-## 使用方式
-
-在 Codex 中直接提出与 Python 环境相关的需求即可，例如：
+## Example prompts
 
 ```text
 帮我用 uv 初始化这个 Python 项目
@@ -69,60 +62,63 @@ git clone https://github.com/dqyydq/python-env-skills.git $env:CODEX_HOME\skills
 安装依赖后报 RuntimeError: Numpy is not available，帮我处理 NumPy 和 torch 的版本冲突
 ```
 
-## 工作流概览
+## Workflow summary
 
-该 skill 会指导 Codex 按以下流程处理环境：
+The skill guides Codex to:
 
-1. 判断项目是 CPU-only 环境，还是需要 PyTorch / CUDA。
-2. 使用 `uv` 初始化项目和管理依赖。
-3. GPU 项目先检测 `nvidia-smi`，读取驱动支持的 CUDA 上限。
-4. 根据 PyTorch 官方页面确认当前可用的 torch / torchvision / torchaudio 版本和 CUDA wheel tag。
-5. 将 PyTorch CUDA index 写入 `pyproject.toml`，避免后续同步时回退到 CPU wheel。
-6. 根据 PyTorch 版本决定是否需要 pin `numpy<2`。
-7. 安装后运行验证命令，确认 CUDA 版 torch 生效。
+1. Decide whether the project is CPU-only or NVIDIA GPU / PyTorch CUDA.
+2. Inspect the existing project before changing files.
+3. Use `uv` to create or reuse a local `.venv`.
+4. For GPU environments, verify the official PyTorch version trio and CUDA index before installing.
+5. Persist PyTorch CUDA sources in `pyproject.toml` using `[[tool.uv.index]]` and `[tool.uv.sources]` with `explicit = true`.
+6. Protect simpler venv / requirements workflows with constraints.
+7. Validate with `uv pip check`, `uv pip tree`, NumPy interop, and CUDA availability checks.
 
-## uv 与 PyTorch CUDA 的关键配置
+## Helper scripts
 
-对于需要 GPU 的项目，不能只临时执行一次带 `--index-url` 的安装命令。更稳妥的方式是把 PyTorch CUDA wheel index 固化到 `pyproject.toml`：
+`scripts/inspect_env.py` prints a read-only JSON report for uv, Python, project files, NVIDIA driver state, and installed torch/numpy packages.
+
+```bash
+python scripts/inspect_env.py --project .
+```
+
+`scripts/torch_guard.py` snapshots a known-good torch installation and checks whether later dependency changes replaced it.
+
+```bash
+uv run python scripts/torch_guard.py snapshot --backend cu126
+uv run python scripts/torch_guard.py check
+```
+
+`scripts/create_uv_env.py` is an interactive helper for creating a CPU or GPU environment. Its PyTorch compatibility matrix is a conservative offline snapshot; when internet access is available, confirm the final GPU install command against the official PyTorch pages first.
+
+```bash
+python scripts/create_uv_env.py
+```
+
+## Key uv / PyTorch CUDA config
+
+For durable GPU projects, do not rely only on a one-time `--index-url`. Persist the accelerator index:
 
 ```toml
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu126" }]
-torchvision = [{ index = "pytorch-cu126" }]
-torchaudio = [{ index = "pytorch-cu126" }]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
+torchaudio = [{ index = "pytorch-cu130" }]
 ```
 
-然后再运行：
+Then pin the exact torch, torchvision, and torchaudio versions and run:
 
 ```bash
-uv add torch torchvision torchaudio
+uv lock --dry-run
+uv lock
+uv sync
 ```
 
-安装完成后验证：
+## Notes
 
-```bash
-uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
-```
-
-在支持 CUDA 的 NVIDIA GPU 机器上，期望结果是：
-
-- `torch.cuda.is_available()` 为 `True`
-- `torch.version.cuda` 不是 `None`
-
-## 重要原则
-
-- 只使用 `uv`，不使用 conda、miniconda 或 mamba。
-- CPU-only 项目不配置 PyTorch CUDA index。
-- GPU 项目不要凭记忆填写 CUDA tag，需要查看 PyTorch 官方当前版本信息。
-- `nvidia-smi` 显示的 CUDA Version 是驱动支持的上限，不等于必须安装的 CUDA 版本。
-- `uv pip install --index-url ...` 适合一次性安装；项目长期维护应使用 `pyproject.toml` 的 `[tool.uv.sources]` 固定来源。
-- 旧版 PyTorch 可能需要 `numpy<2`，具体见 `references/numpy-torch-compatibility.md`。
-
-## 发布说明
-
-这个仓库是一个 skill 源目录，不是普通 Python 包。它不需要通过 `pip install` 安装，也不要求包含 `setup.py`、`pyproject.toml` 或包入口文件。只要目录中包含有效的 `SKILL.md`，并放置在 Codex 可发现的 skills 路径下即可使用。
+This repository is a skill source directory, not a Python package. It does not need `pip install`, `setup.py`, or package entry points. Codex discovers it from the `SKILL.md` frontmatter when the directory is placed under a skills path.

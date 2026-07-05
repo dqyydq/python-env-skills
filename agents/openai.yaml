@@ -1,4 +1,4 @@
 interface:
   display_name: "Python Env Setup"
-  short_description: "Set up uv Python environments, including PyTorch CUDA and NumPy compatibility."
-  default_prompt: "Use $python-env-setup to create a uv-managed Python environment and verify the correct CPU or GPU PyTorch setup."
+  short_description: "Create, inspect, and repair uv Python environments, including guarded PyTorch CUDA installs."
+  default_prompt: "Use $python-env-setup to set up or repair a uv-managed Python environment and verify the correct CPU or GPU PyTorch configuration."
